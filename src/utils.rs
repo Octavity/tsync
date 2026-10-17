@@ -5,6 +5,7 @@ use std::{
 
 use crate::errors::Result;
 
+pub mod cache;
 pub mod ffmpeg;
 pub mod fs;
 pub mod parallel;

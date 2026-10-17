@@ -16,7 +16,6 @@ trait FSEmu {
     fn available() -> Result<bool>;
     fn build_file_list(source: &Path) -> Result<HashSet<PathBuf>>;
     fn cp(source: &Path, target: &Path) -> Result<()>;
-    fn exists(source: &Path) -> Result<bool>;
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -54,14 +53,6 @@ impl FSBackend {
             FSBackend::Adb => BackendADB::cp(source, target),
             FSBackend::Ftp => Err(Error::descriptive("FTP backend is not implemented yet")),
             FSBackend::None => BackendNone::cp(source, target),
-        }
-    }
-
-    pub fn exists(&self, source: &Path) -> Result<bool> {
-        match self {
-            FSBackend::Adb => BackendADB::exists(source),
-            FSBackend::Ftp => Err(Error::descriptive("FTP backend is not implemented yet")),
-            FSBackend::None => BackendNone::exists(source),
         }
     }
 }
@@ -106,10 +97,6 @@ impl FSEmu for BackendNone {
         }
 
         Ok(())
-    }
-
-    fn exists(source: &Path) -> Result<bool> {
-        Ok(source.try_exists()?)
     }
 }
 
@@ -186,13 +173,16 @@ impl FSEmu for BackendADB {
 
         Ok(())
     }
+}
 
-    fn exists(source: &Path) -> Result<bool> {
-        // For some reason adb shell only accepts "escaped paths", like path/dir/location.opus -> "path/dir/location" with string quotes
-        let path = format!(r#""{}""#, source.to_string_lossy().replace('\\', "/"));
-        let output = Command::new("adb").arg("shell").arg("ls").arg(path).output()?;
-
-        Ok(output.status.success())
+/// Returns true when `ext` matches any of the expected extensions.
+///
+/// Extensions are compared case-insensitively so a library containing `TRACK.FLAC` or
+/// `Cover.JPG` isn't silently dropped on case-sensitive filesystems.
+fn matches_extension(ext: &str, extensions: &Option<Vec<&'static str>>) -> bool {
+    match extensions {
+        Some(exts) => exts.iter().any(|allowed| allowed.eq_ignore_ascii_case(ext)),
+        None => true,
     }
 }
 
@@ -213,10 +203,9 @@ pub fn read_dir_recursively<P: AsRef<Path>>(path: P, extensions: &Option<Vec<&'s
             Some(ext) => ext,
             None => continue,
         };
-        match extensions {
-            Some(exts) if exts.contains(&ext) => files.push(path),
-            None => files.push(path),
-            _ => continue,
+
+        if matches_extension(ext, extensions) {
+            files.push(path);
         }
     }
 
@@ -247,12 +236,67 @@ where
             Some(ext) => ext,
             None => continue,
         };
-        match extensions {
-            Some(exts) if exts.contains(&ext) => files.push(path.to_path_buf()),
-            None => files.push(path.to_path_buf()),
-            _ => continue,
+
+        if matches_extension(ext, extensions) {
+            files.push(path.to_path_buf());
         }
     }
 
     Ok(files)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_dir_recursively;
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    fn unique_temp_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("tsync-test-{name}-{nanos}"))
+    }
+
+    #[test]
+    fn read_dir_recursively_matches_extensions_case_insensitively() {
+        let root = unique_temp_path("recursive");
+        let nested = root.join("Album");
+        fs::create_dir_all(&nested).expect("source dirs should be created");
+
+        for (dir, name) in [
+            (&root, "a.flac"),
+            (&root, "b.FLAC"),
+            (&nested, "c.Flac"),
+            (&nested, "d.opus"),
+            (&nested, "notes.txt"),
+            (&nested, "noext"),
+        ] {
+            fs::write(dir.join(name), b"x").expect("test file should be written");
+        }
+
+        let found = read_dir_recursively(&root, &Some(vec!["flac"])).expect("listing should succeed");
+        let mut names = found
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            .collect::<Vec<_>>();
+        names.sort();
+
+        assert_eq!(names, vec!["a.flac", "b.FLAC", "c.Flac"]);
+
+        // Extension-less files are skipped even when no extension filter is given.
+        let all = read_dir_recursively(&root, &None).expect("listing should succeed");
+        assert_eq!(all.len(), 5);
+
+        // A case-mismatched filter entry should still match the on-disk casing.
+        let upper = read_dir_recursively(&root, &Some(vec!["OPUS"])).expect("listing should succeed");
+        assert_eq!(upper.len(), 1);
+        assert!(upper[0].ends_with("d.opus"));
+
+        let _ = fs::remove_dir_all(root);
+    }
 }
